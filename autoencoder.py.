@@ -1,0 +1,146 @@
+"""Train or test a convolutional autoencoder on 150×225 RGB images.
+
+Usage
+-----
+# train (writes model.pt)
+python autoencoder.py --data data/ --epochs 15 --lr 0.001
+
+# test an existing model
+python autoencoder.py --data data/ --checkpoint model.pt --test
+"""
+
+import argparse
+import pathlib
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+from skimage.metrics import structural_similarity as ssim
+import matplotlib.pyplot as plt
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+class Autoencoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 8, 3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+        # decoder
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(8, 32, 3, stride=2, padding=1, output_padding=(0, 0)),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, 3, stride=2, padding=1, output_padding=(1, 0)),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
+# ─── Data helpers ─────────────────────────────────────────────────────────────
+def load_dataset(folder: pathlib.Path) -> torch.Tensor:
+    """Load *.npy subsets, stack, normalise, return as (N, C, H, W) tensor."""
+    arrays = [np.load(fp) for fp in folder.glob("*.npy")]
+    data = np.vstack(arrays).reshape(-1, 150, 225, 3) / 255.0
+    return torch.tensor(data, dtype=torch.float32).permute(0, 3, 1, 2)
+
+
+def make_loaders(dataset, batch_size=32):
+    train_len = int(0.8 * len(dataset))
+    test_len = len(dataset) - train_len
+    train_set, test_set = random_split(dataset, [train_len, test_len])
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=8, shuffle=False)
+    return train_loader, test_loader
+
+
+# ─── Train / Test loops ───────────────────────────────────────────────────────
+def train(model, loader, epochs, lr, device):
+    optimiser = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    losses = []
+
+    for epoch in range(epochs):
+        model.train()
+        running = 0.0
+        for imgs in loader:
+            imgs = imgs.to(device)
+            preds = model(imgs)
+            loss = criterion(preds, imgs)
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+            running += loss.item()
+        avg = running / len(loader)
+        losses.append(avg)
+        print(f"Epoch {epoch+1}/{epochs} – loss {avg:.4f}")
+    return losses
+
+
+def evaluate(model, loader, device):
+    model.eval()
+    mse_total, ssim_scores = 0.0, []
+    with torch.no_grad():
+        for imgs in loader:
+            imgs = imgs.to(device)
+            preds = model(imgs)
+            mse_total += F.mse_loss(preds, imgs, reduction="sum").item()
+
+            # SSIM per image
+            imgs_np = imgs.cpu().numpy()
+            preds_np = preds.cpu().numpy()
+            for i in range(imgs_np.shape[0]):
+                ssim_scores.append(
+                    ssim(imgs_np[i].mean(0), preds_np[i].mean(0), data_range=1.0)
+                )
+
+    n_pix = len(loader.dataset) * 150 * 225 * 3
+    mse = mse_total / n_pix
+    return mse, float(np.mean(ssim_scores))
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", type=str, required=True, help="folder with *.npy files")
+    p.add_argument("--epochs", type=int, default=15)
+    p.add_argument("--lr", type=float, default=0.001)
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--checkpoint", type=str, default="model.pt")
+    p.add_argument("--test", action="store_true", help="only run evaluation")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("loading data …")
+    dataset = load_dataset(pathlib.Path(args.data))
+    train_loader, test_loader = make_loaders(dataset, args.batch)
+
+    model = Autoencoder().to(device)
+
+    if not args.test:
+        print("training …")
+        train(model, train_loader, args.epochs, args.lr, device)
+        torch.save(model.state_dict(), args.checkpoint)
+        print(f"saved to {args.checkpoint}")
+
+    else:
+        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        print(f"loaded {args.checkpoint}")
+
+    mse, ssim_score = evaluate(model, test_loader, device)
+    print(f"Test MSE  : {mse:.6f}")
+    print(f"Average SSIM: {ssim_score:.4f}")
+
+
+if __name__ == "__main__":
+    main()
